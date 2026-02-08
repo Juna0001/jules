@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024, Your Company."
 #property link      "https://www.mql5.com"
-#property version   "1.01"
+#property version   "1.02"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -19,11 +19,16 @@ input int      InpMAPeriod    = 20;          // MA Period for GSR (Closed Bars)
 input double   InpBBDeviation = 2.0;         // Bollinger Bands Deviation
 input double   InpMaxDeviation= 4.0;         // Max Deviation (Stop Loss)
 input int      InpSlippage    = 3;           // Slippage
+input int      InpMaxRetries  = 5;           // Max Retries for 2nd Leg
+input int      InpRetryDelay  = 500;         // Delay between retries (ms)
 
 //--- Global variables
 CTrade         trade;
 double         xau_point, xag_point;
 int            xau_digits, xag_digits;
+datetime       last_bar_time = 0;
+double         g_gsr_mean = 0.0;
+double         g_gsr_stddev = 0.0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -66,11 +71,22 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
   {
-//--- Check if new bar (optional for performance, but we use OnTick logic here)
-//--- Calculate GSR Statistics (Mean, StdDev) using Closed Bars (Index 1 to Period)
-   double gsr_mean, gsr_stddev;
-   if(!CalculateGSRStats(gsr_mean, gsr_stddev))
-      return;
+//--- Check for New Bar to update statistics
+   datetime current_time = iTime(InpSymbolXAU, PERIOD_CURRENT, 0);
+   if(last_bar_time != current_time)
+     {
+      if(CalculateGSRStats(g_gsr_mean, g_gsr_stddev))
+        {
+         last_bar_time = current_time;
+         Print("Updated GSR Stats: Mean=", g_gsr_mean, " StdDev=", g_gsr_stddev);
+        }
+      else
+        {
+         return; // Data not ready
+        }
+     }
+
+   if(g_gsr_mean == 0.0) return; // Stats not calculated yet
 
 //--- Get Current Prices
    double xau_ask = SymbolInfoDouble(InpSymbolXAU, SYMBOL_ASK);
@@ -78,21 +94,30 @@ void OnTick()
    double xag_ask = SymbolInfoDouble(InpSymbolXAG, SYMBOL_ASK);
    double xag_bid = SymbolInfoDouble(InpSymbolXAG, SYMBOL_BID);
 
-   if(xag_bid == 0 || xag_ask == 0) return; // Prevent division by zero
+   if(xag_bid == 0 || xag_ask == 0) return;
 
-   double current_gsr = (xau_bid + xau_ask) / 2.0 / ((xag_bid + xag_ask) / 2.0); // Use Mid price for Realtime GSR
+   // Calculate GSR based on Execution Prices (Spread Aware)
+   // For Selling Ratio: Sell Gold (Bid) / Buy Silver (Ask)
+   double gsr_sell = xau_bid / xag_ask;
+   // For Buying Ratio: Buy Gold (Ask) / Sell Silver (Bid)
+   double gsr_buy = xau_ask / xag_bid;
+
+   // Mid Price GSR for Mean Reversion Check
+   double mid_gsr = ((xau_bid + xau_ask) / 2.0) / ((xag_bid + xag_ask) / 2.0);
 
 //--- Define Bands
-   double upper_band = gsr_mean + (gsr_stddev * InpBBDeviation);
-   double lower_band = gsr_mean - (gsr_stddev * InpBBDeviation);
-   double stop_upper = gsr_mean + (gsr_stddev * InpMaxDeviation);
-   double stop_lower = gsr_mean - (gsr_stddev * InpMaxDeviation);
+   double upper_band = g_gsr_mean + (g_gsr_stddev * InpBBDeviation);
+   double lower_band = g_gsr_mean - (g_gsr_stddev * InpBBDeviation);
+   double stop_upper = g_gsr_mean + (g_gsr_stddev * InpMaxDeviation);
+   double stop_lower = g_gsr_mean - (g_gsr_stddev * InpMaxDeviation);
 
 //--- Check Existing Positions
-   bool pos_long_gsr = false; // Long Gold, Short Silver (Betting on GSR UP)
-   bool pos_short_gsr = false; // Short Gold, Long Silver (Betting on GSR DOWN)
+   bool pos_long_gsr = false; // Long Gold, Short Silver
+   bool pos_short_gsr = false; // Short Gold, Long Silver
    int xau_pos_count = 0;
    int xag_pos_count = 0;
+   ulong xau_ticket = 0; // To track orphan ticket
+   ulong xag_ticket = 0;
    int positions_count = PositionsTotal();
 
    for(int i = positions_count - 1; i >= 0; i--)
@@ -106,57 +131,95 @@ void OnTick()
          if(symbol == InpSymbolXAU)
            {
             xau_pos_count++;
-            if(type == POSITION_TYPE_BUY) pos_long_gsr = true; // Bought Gold
-            if(type == POSITION_TYPE_SELL) pos_short_gsr = true; // Sold Gold
+            xau_ticket = ticket;
+            if(type == POSITION_TYPE_BUY) pos_long_gsr = true;
+            if(type == POSITION_TYPE_SELL) pos_short_gsr = true;
            }
          else if(symbol == InpSymbolXAG)
            {
             xag_pos_count++;
-            // Note: In a pair trade, Long GSR implies Short Silver.
-            // If we have Long Silver, that implies Short GSR.
+            xag_ticket = ticket;
            }
         }
      }
 
-   // Detect Orphan Positions (Only Gold or Only Silver)
+   // Handle Orphans (If count mismatch)
    if(xau_pos_count != xag_pos_count)
      {
-      // Simplistic handling: Do not enter new trades. Ideally, close orphans or alert user.
-      // For this version, we prevent new entries.
+      // Simple Fail-Safe: Close the orphan position immediately
+      Print("Orphan Position Detected! Closing to neutralize risk.");
+      if(xau_pos_count > 0) trade.PositionClose(xau_ticket);
+      if(xag_pos_count > 0) trade.PositionClose(xag_ticket);
       return;
      }
 
 //--- Entry Logic
-   if(xau_pos_count == 0 && xag_pos_count == 0) // No positions at all
+   if(xau_pos_count == 0 && xag_pos_count == 0)
      {
       // Sell Signal (GSR High -> Sell Gold, Buy Silver)
-      if(current_gsr > upper_band)
+      // Use gsr_sell (Bid/Ask) to account for spread cost
+      if(gsr_sell > upper_band)
         {
          double lot_xag = CalculateSilverLots(InpBaseLotXAU, xau_bid, xag_ask);
          if(lot_xag > 0)
            {
+            // Execute Leg 1: Sell Gold
             if(trade.Sell(InpBaseLotXAU, InpSymbolXAU, xau_bid, 0, 0, "GSR Short Entry (Sell Gold)"))
               {
-               if(!trade.Buy(lot_xag, InpSymbolXAG, xag_ask, 0, 0, "GSR Short Entry (Buy Silver)"))
+               ulong ticket1 = trade.ResultOrder(); // Get ticket of first leg
+               bool leg2_success = false;
+
+               // Retry Logic for Leg 2: Buy Silver
+               for(int r=0; r<InpMaxRetries; r++)
                  {
-                  Print("Error opening Silver leg! Close Gold manually.");
-                  // Advanced: Close XAU immediately to avoid orphan
+                  double current_ask = SymbolInfoDouble(InpSymbolXAG, SYMBOL_ASK);
+                  if(trade.Buy(lot_xag, InpSymbolXAG, current_ask, 0, 0, "GSR Short Entry (Buy Silver)"))
+                    {
+                     leg2_success = true;
+                     break;
+                    }
+                  Sleep(InpRetryDelay);
+                 }
+
+               // Fail-Safe: If Leg 2 failed after retries, Close Leg 1
+               if(!leg2_success)
+                 {
+                  Print("Leg 2 Failed! Closing Leg 1 immediately.");
+                  trade.PositionClose(ticket1);
                  }
               }
            }
         }
       // Buy Signal (GSR Low -> Buy Gold, Sell Silver)
-      else if(current_gsr < lower_band)
+      // Use gsr_buy (Ask/Bid)
+      else if(gsr_buy < lower_band)
         {
          double lot_xag = CalculateSilverLots(InpBaseLotXAU, xau_ask, xag_bid);
          if(lot_xag > 0)
            {
+            // Execute Leg 1: Buy Gold
             if(trade.Buy(InpBaseLotXAU, InpSymbolXAU, xau_ask, 0, 0, "GSR Long Entry (Buy Gold)"))
               {
-               if(!trade.Sell(lot_xag, InpSymbolXAG, xag_bid, 0, 0, "GSR Long Entry (Sell Silver)"))
+               ulong ticket1 = trade.ResultOrder();
+               bool leg2_success = false;
+
+               // Retry Logic for Leg 2: Sell Silver
+               for(int r=0; r<InpMaxRetries; r++)
                  {
-                  Print("Error opening Silver leg! Close Gold manually.");
-                  // Advanced: Close XAU immediately to avoid orphan
+                  double current_bid = SymbolInfoDouble(InpSymbolXAG, SYMBOL_BID);
+                  if(trade.Sell(lot_xag, InpSymbolXAG, current_bid, 0, 0, "GSR Long Entry (Sell Silver)"))
+                    {
+                     leg2_success = true;
+                     break;
+                    }
+                  Sleep(InpRetryDelay);
+                 }
+
+               // Fail-Safe
+               if(!leg2_success)
+                 {
+                  Print("Leg 2 Failed! Closing Leg 1 immediately.");
+                  trade.PositionClose(ticket1);
                  }
               }
            }
@@ -164,21 +227,19 @@ void OnTick()
      }
 
 //--- Exit Logic
-   // Logic assumes paired positions exist. If orphans exist, this might still trigger if conditions met.
+   // Use Mid-Price GSR for Mean Reversion to avoid premature exit due to spread widening
 
-   if(pos_short_gsr) // We are Short GSR (Short Gold, Long Silver)
+   if(pos_short_gsr) // Short Gold, Long Silver
      {
-      // Take Profit (Mean Reversion) OR Stop Loss (Divergence Expanded)
-      if(current_gsr <= gsr_mean || current_gsr >= stop_upper)
+      if(mid_gsr <= g_gsr_mean || mid_gsr >= stop_upper)
         {
          CloseAllPositions();
         }
      }
 
-   if(pos_long_gsr) // We are Long GSR (Long Gold, Short Silver)
+   if(pos_long_gsr) // Long Gold, Short Silver
      {
-      // Take Profit (Mean Reversion) OR Stop Loss (Divergence Expanded)
-      if(current_gsr >= gsr_mean || current_gsr <= stop_lower)
+      if(mid_gsr >= g_gsr_mean || mid_gsr <= stop_lower)
         {
          CloseAllPositions();
         }
@@ -196,7 +257,6 @@ bool CalculateGSRStats(double &mean, double &stddev)
    ArraySetAsSeries(xau_close, true);
    ArraySetAsSeries(xau_time, true);
 
-   // Get historical XAU Data (Close and Time) for Period + 1 (to skip index 0)
    int bars_needed = InpMAPeriod + 1;
 
    int copied_xau = CopyClose(InpSymbolXAU, PERIOD_CURRENT, 0, bars_needed, xau_close);
@@ -210,16 +270,11 @@ bool CalculateGSRStats(double &mean, double &stddev)
    ArrayResize(ratios, InpMAPeriod);
    int count = 0;
 
-   // Iterate from index 1 (last closed bar) to InpMAPeriod
    for(int i = 1; i <= InpMAPeriod; i++)
      {
-      // For each XAU bar time, get the corresponding XAG Close
       double xag_close_val[1];
-      // Use CopyClose with start_time and count=1
       if(CopyClose(InpSymbolXAG, PERIOD_CURRENT, xau_time[i], 1, xag_close_val) != 1)
         {
-         // If XAG data is missing for this timestamp, skip this sample
-         // This reduces the sample size slightly but maintains time alignment
          continue;
         }
 
@@ -230,7 +285,7 @@ bool CalculateGSRStats(double &mean, double &stddev)
       count++;
      }
 
-   if(count < InpMAPeriod / 2) return(false); // Too few valid data points
+   if(count < InpMAPeriod / 2) return(false);
 
    mean = sum / count;
 
@@ -251,17 +306,12 @@ double CalculateSilverLots(double gold_lots, double gold_price, double silver_pr
   {
    if(silver_price == 0) return(0.0);
 
-   // Get Contract Sizes
    double contract_size_xau = SymbolInfoDouble(InpSymbolXAU, SYMBOL_TRADE_CONTRACT_SIZE);
    double contract_size_xag = SymbolInfoDouble(InpSymbolXAG, SYMBOL_TRADE_CONTRACT_SIZE);
 
-   // Calculate Notional Value of Gold Position
    double gold_value = gold_lots * gold_price * contract_size_xau;
-
-   // Calculate Required Silver Lots
    double raw_silver_lots = gold_value / (silver_price * contract_size_xag);
 
-   // Normalize to Lot Step
    double step = SymbolInfoDouble(InpSymbolXAG, SYMBOL_VOLUME_STEP);
    double min_vol = SymbolInfoDouble(InpSymbolXAG, SYMBOL_VOLUME_MIN);
    double max_vol = SymbolInfoDouble(InpSymbolXAG, SYMBOL_VOLUME_MAX);
