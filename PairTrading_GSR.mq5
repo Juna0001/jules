@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024, Your Company."
 #property link      "https://www.mql5.com"
-#property version   "1.02"
+#property version   "1.03"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -29,6 +29,10 @@ int            xau_digits, xag_digits;
 datetime       last_bar_time = 0;
 double         g_gsr_mean = 0.0;
 double         g_gsr_stddev = 0.0;
+
+//--- Execution Control
+datetime       last_trade_attempt_time = 0;
+const int      TRADE_COOLDOWN_SEC = 60; // 1 minute cooldown after failure
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -150,10 +154,16 @@ void OnTick()
       Print("Orphan Position Detected! Closing to neutralize risk.");
       if(xau_pos_count > 0) trade.PositionClose(xau_ticket);
       if(xag_pos_count > 0) trade.PositionClose(xag_ticket);
+
+      // Set Cooldown to prevent immediate retry
+      last_trade_attempt_time = TimeCurrent();
       return;
      }
 
 //--- Entry Logic
+   // Check Cooldown
+   if(TimeCurrent() < last_trade_attempt_time + TRADE_COOLDOWN_SEC) return;
+
    if(xau_pos_count == 0 && xag_pos_count == 0)
      {
       // Sell Signal (GSR High -> Sell Gold, Buy Silver)
@@ -161,7 +171,9 @@ void OnTick()
       if(gsr_sell > upper_band)
         {
          double lot_xag = CalculateSilverLots(InpBaseLotXAU, xau_bid, xag_ask);
-         if(lot_xag > 0)
+
+         // Strict Check before execution
+         if(CheckVolumeRequirements(InpSymbolXAG, lot_xag))
            {
             // Execute Leg 1: Sell Gold
             if(trade.Sell(InpBaseLotXAU, InpSymbolXAU, xau_bid, 0, 0, "GSR Short Entry (Sell Gold)"))
@@ -184,10 +196,21 @@ void OnTick()
                // Fail-Safe: If Leg 2 failed after retries, Close Leg 1
                if(!leg2_success)
                  {
-                  Print("Leg 2 Failed! Closing Leg 1 immediately.");
+                  Print("Leg 2 Failed! Closing Leg 1 immediately. Error: ", GetLastError());
                   trade.PositionClose(ticket1);
+                  last_trade_attempt_time = TimeCurrent(); // Activate Cooldown
                  }
               }
+             else
+              {
+               Print("Leg 1 Failed. Error: ", GetLastError());
+               last_trade_attempt_time = TimeCurrent(); // Activate Cooldown
+              }
+           }
+         else
+           {
+            Print("Invalid Volume for Silver: ", lot_xag);
+            last_trade_attempt_time = TimeCurrent(); // Activate Cooldown
            }
         }
       // Buy Signal (GSR Low -> Buy Gold, Sell Silver)
@@ -195,7 +218,8 @@ void OnTick()
       else if(gsr_buy < lower_band)
         {
          double lot_xag = CalculateSilverLots(InpBaseLotXAU, xau_ask, xag_bid);
-         if(lot_xag > 0)
+
+         if(CheckVolumeRequirements(InpSymbolXAG, lot_xag))
            {
             // Execute Leg 1: Buy Gold
             if(trade.Buy(InpBaseLotXAU, InpSymbolXAU, xau_ask, 0, 0, "GSR Long Entry (Buy Gold)"))
@@ -218,10 +242,21 @@ void OnTick()
                // Fail-Safe
                if(!leg2_success)
                  {
-                  Print("Leg 2 Failed! Closing Leg 1 immediately.");
+                  Print("Leg 2 Failed! Closing Leg 1 immediately. Error: ", GetLastError());
                   trade.PositionClose(ticket1);
+                  last_trade_attempt_time = TimeCurrent(); // Activate Cooldown
                  }
               }
+             else
+              {
+               Print("Leg 1 Failed. Error: ", GetLastError());
+               last_trade_attempt_time = TimeCurrent(); // Activate Cooldown
+              }
+           }
+         else
+           {
+            Print("Invalid Volume for Silver: ", lot_xag);
+            last_trade_attempt_time = TimeCurrent(); // Activate Cooldown
            }
         }
      }
@@ -322,6 +357,24 @@ double CalculateSilverLots(double gold_lots, double gold_price, double silver_pr
    if(normalized_lots > max_vol) normalized_lots = max_vol;
 
    return(normalized_lots);
+  }
+
+//+------------------------------------------------------------------+
+//| Check Volume Requirements                                        |
+//+------------------------------------------------------------------+
+bool CheckVolumeRequirements(string symbol, double volume)
+  {
+   double min_vol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   double max_vol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+   double step_vol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+
+   if(volume < min_vol) return(false);
+   if(volume > max_vol) return(false);
+
+   // Check if volume is multiple of step
+   // if(MathMod(volume, step_vol) > 0.000001) return(false); // Can be strict
+
+   return(true);
   }
 
 //+------------------------------------------------------------------+
